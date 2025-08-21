@@ -258,12 +258,25 @@ def main():
     p.add_argument("--query", default="avg_arr_delay_by_airline", choices=list(AGGS.keys()))
     p.add_argument("--csv", default=CSV_PATH, help="Path to CSV (overrides .env CSV_PATH).")
     p.add_argument("--clear-cache", action="store_true", help="Clear cached aggregations and exit.")
+    p.add_argument("--show-cache", action="store_true", help="List keys and values currently cached in Redis")
+
     args = p.parse_args()
 
     if args.clear_cache:
         clear_prefix("agg:")
         logging.info("Cache cleared.")
         return
+ 
+    if args.show_cache:
+    from cache import list_cache
+    entries = list_cache()
+    if not entries:
+        print("No cache entries found.")
+    else:
+        print(f"Found {len(entries)} cached keys:\n")
+        for k, v in entries:
+            print(f"{k} -> {v}")
+    sys.exit(0)
 
     logging.info("Running query=%s on csv=%s", args.query, args.csv)
     t0 = time.perf_counter()

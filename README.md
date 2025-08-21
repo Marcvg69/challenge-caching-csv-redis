@@ -33,8 +33,8 @@ Below is the latest benchmark (auto-generated):
 
 | Operation | n | Avg (ns) | Median (ns) | Std (ns) |
 |---|---:|---:|---:|---:|
-| HIT | 50,214 | 143.5 | 125.0 | 54.9 |
-| MISS | 49,786 | 131.4 | 125.0 | 80.1 |
+| HIT | 49,949 | 154.4 | 166.0 | 95.8 |
+| MISS | 50,051 | 137.6 | 125.0 | 184.6 |
 
 <!-- BENCHMARK:END -->
 

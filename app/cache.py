@@ -61,3 +61,15 @@ def clear_prefix(prefix="agg:"):
     for k in r.scan_iter(match=f"{prefix}*"):
         r.delete(k)
 
+def list_cache(prefix="agg:"):
+"""List keys and values currently cached in Redis"""
+    keys = r.keys(f"{prefix}*")
+    result = []
+    for k in keys:
+        val = r.get(k)
+        if val:
+            snippet = val[:80] + ("..." if len(val) > 80 else "")
+            result.append((k, snippet))
+        else:
+            result.append((k, None))
+    return result
