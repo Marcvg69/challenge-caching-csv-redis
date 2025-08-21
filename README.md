@@ -160,3 +160,15 @@ It fulfills all required goals and several nice-to-haves.
 **Marc Van Goolen**  
 Data Science Bootcamp, Belgium  
 _Solo project_
+
+
+## Benchmark
+
+<!-- BENCHMARK:START -->
+
+| query                    |   miss_sec |   hit_sec |
+|:-------------------------|-----------:|----------:|
+| avg_arr_delay_by_airline |     29.743 |     0.696 |
+| flights_by_origin        |     30.774 |     0.729 |
+| avg_dep_delay_by_month   |     30.563 |     0.65  |
+<!-- BENCHMARK:END -->
