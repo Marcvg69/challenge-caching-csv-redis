@@ -1,291 +1,389 @@
+#!/usr/bin/env python3
 """
-Large CSV Caching Demo (Kaggle-compatible, chunk-aware, with optional enrichment)
+main.py — CSV -> Redis cached analytics
 
-What this program does
-----------------------
-- Reads a large CSV (path from --csv or .env CSV_PATH). Supports Kaggle 'usdot/flight-delays'.
-- Computes aggregations (groupbys).
-- Caches each aggregation result in Redis with a TTL.
-- Logs CACHE_HIT (fast) vs CACHE_MISS (compute+cache) with timings.
-- Handles very large files by streaming in chunks (CHUNKSIZE in .env).
-- Optionally enriches results with airline and airport names if AIRLINES_CSV / AIRPORTS_CSV are set.
+Queries:
+  - avg_arr_delay_by_airline
+  - flights_by_origin
+  - avg_dep_delay_by_month
 
-Why chunking
-------------
-If your CSV is hundreds of MB or more, reading it all into RAM can be slow or impossible.
-With chunking we aggregate incrementally and keep memory usage almost constant.
+Flags:
+  --clear-cache        Clear 'agg:' keys and exit
+  --show-cache         List keys/snippets from Redis and exit
+  --full               With --show-cache, pretty-print full JSON
+  --limit N            Print top-N rows of the query result (default 10)
+  --csv PATH           Override CSV path (else take CSV_PATH from .env)
 
-Supported schemas
------------------
-1) Kaggle 'usdot/flight-delays' (columns like: AIRLINE, ORIGIN_AIRPORT, DESTINATION_AIRPORT,
-   DEPARTURE_DELAY, ARRIVAL_DELAY, YEAR, MONTH, DAY, ...)
-2) BTS-style files with columns like: OP_CARRIER, ORIGIN, DEST, DEP_DELAY, ARR_DELAY, FL_DATE
-
-We normalize both to a common set inside the code:
-  CARRIER, ORIGIN, DEST, DEP_DELAY, ARR_DELAY, MONTH_LABEL (YYYY-MM string)
-
-Run examples
-------------
-    python app/main.py --query avg_arr_delay_by_airline
-    python app/main.py --query flights_by_origin
-    python app/main.py --query avg_dep_delay_by_month
-    python app/main.py --clear-cache
+Env (.env is auto-loaded):
+  CSV_PATH             Default CSV path (e.g., /Users/Marc/Datasets/.../flights.csv)
+  AIRLINES_CSV         Optional: code->name lookup for airlines
+  AIRPORTS_CSV         Optional: code->name lookup for airports
+  CACHE_TTL_SECONDS    TTL for cached results (default: 3600)
+  CHUNKSIZE            If set (>0), enable chunked processing
+  REDIS_*              Handled in app.cache
 """
-import os, time, argparse, logging, json
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Iterable, List
+
 import pandas as pd
-from dotenv import load_dotenv
-from cache import key_for, get_json, set_json, incr, clear_prefix
 
-# ----------------- Setup & config -----------------
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Minimal .env loader (no external deps). MUST run BEFORE reading env vars.
+# ---------------------------------------------------------------------------
+def load_env(override: bool = False):
+    for path in (os.path.join(os.getcwd(), ".env"), os.path.join(os.getcwd(), "app", ".env")):
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if not override and k in os.environ:
+                    continue
+                os.environ[k] = v
+        break
 
-CSV_PATH      = os.getenv("CSV_PATH", "./data/flights.csv")
-AIRLINES_CSV  = os.getenv("AIRLINES_CSV")  # optional
-AIRPORTS_CSV  = os.getenv("AIRPORTS_CSV")  # optional
-CHUNKSIZE     = int(os.getenv("CHUNKSIZE", "0"))  # 0 = in-memory, >0 = chunked streaming
+load_env(override=False)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+# 🔧 IMPORTANT: use absolute package import
+from app.cache import (
+    key_for,
+    get_json,
+    set_json,
+    incr,
+    clear_prefix,
+    list_cache,
+)
 
-# ----------------- Schema detection -----------------
+# Logging
+logging.basicConfig(
+    level=os.getenv("LOGLEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+# Defaults (read AFTER .env is loaded)
+CSV_PATH_DEFAULT = os.getenv("CSV_PATH", "data/Flights.csv")
+DEFAULT_TTL = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
+CHUNK_SIZE_ENV = os.getenv("CHUNKSIZE", "").strip()
+PRINT_LIMIT_DEFAULT = 10
+
+# Columns we actually need (prevents DtypeWarning & saves memory)
+REQUIRED_COLS_KAGGLE = [
+    "AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT",
+    "DEPARTURE_DELAY", "ARRIVAL_DELAY", "YEAR", "MONTH"
+]
+REQUIRED_COLS_BTS = [
+    "OP_CARRIER", "ORIGIN", "DEST",
+    "DEP_DELAY", "ARR_DELAY", "FL_DATE"
+]
+
+# ---------- Schema detection & normalization ----------
+def read_header(csv_path: str) -> List[str]:
+    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+        first = f.readline()
+        if "," not in first:
+            df = pd.read_csv(csv_path, nrows=0)
+            return [c for c in df.columns]
+        return [c.strip() for c in first.strip().split(",")]
+
 def detect_schema(csv_path: str) -> str:
-    """
-    Peek at header to decide which column names to expect.
-    Returns 'KAGGLE' or 'BTS'.
-    """
-    cols = pd.read_csv(csv_path, nrows=0).columns
-    if "AIRLINE" in cols and "ORIGIN_AIRPORT" in cols:
+    cols = {c.upper() for c in read_header(csv_path)}
+    if {"AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT", "DEPARTURE_DELAY", "ARRIVAL_DELAY"} <= cols:
         return "KAGGLE"
-    if "OP_CARRIER" in cols and "ORIGIN" in cols:
+    if {"OP_CARRIER", "ORIGIN", "DEST", "DEP_DELAY", "ARR_DELAY"} <= cols:
         return "BTS"
-    raise SystemExit("Unsupported CSV schema. Please provide Kaggle 'flights.csv' or BTS-style file.")
+    df = pd.read_csv(csv_path, nrows=0)
+    up = {c.upper() for c in df.columns}
+    if {"AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT", "DEPARTURE_DELAY", "ARRIVAL_DELAY"} <= up:
+        return "KAGGLE"
+    if {"OP_CARRIER", "ORIGIN", "DEST", "DEP_DELAY", "ARR_DELAY"} <= up:
+        return "BTS"
+    raise ValueError("Could not detect schema (KAGGLE or BTS).")
 
-def usecols_for(schema: str):
-    """Columns to read from the CSV for each schema (minimal set to save memory)."""
-    if schema == "KAGGLE":
-        # We build month labels from YEAR+MONTH; DAY not required for these aggs.
-        return ["AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT",
-                "DEPARTURE_DELAY", "ARRIVAL_DELAY", "YEAR", "MONTH"]
-    # BTS
-    return ["OP_CARRIER", "ORIGIN", "DEST", "DEP_DELAY", "ARR_DELAY", "FL_DATE"]
+def normalize_df(df: pd.DataFrame, schema: str) -> pd.DataFrame:
+    d = df.copy()
+    up = {c.upper(): c for c in d.columns}
 
-def normalize_columns(df: pd.DataFrame, schema: str) -> pd.DataFrame:
-    """
-    Convert the DataFrame to a canonical schema:
-      CARRIER, ORIGIN, DEST, DEP_DELAY, ARR_DELAY, MONTH_LABEL
-    - For KAGGLE: MONTH_LABEL = f"{YEAR:04d}-{MONTH:02d}"
-    - For BTS:    MONTH_LABEL from FL_DATE.to_period('M')
-    """
     if schema == "KAGGLE":
-        df = df.rename(columns={
-            "AIRLINE": "CARRIER",
-            "ORIGIN_AIRPORT": "ORIGIN",
-            "DESTINATION_AIRPORT": "DEST",
-            "DEPARTURE_DELAY": "DEP_DELAY",
-            "ARRIVAL_DELAY": "ARR_DELAY",
-        })
-        # Build YYYY-MM label from YEAR/MONTH (both are ints in Kaggle dataset)
-        df["MONTH_LABEL"] = (df["YEAR"].astype(int)).astype(str) + "-" + df["MONTH"].astype(int).map("{:02d}".format)
-        return df[["CARRIER", "ORIGIN", "DEST", "DEP_DELAY", "ARR_DELAY", "MONTH_LABEL"]]
+        d["CARRIER"] = d[up["AIRLINE"]]
+        d["ORIGIN"] = d[up["ORIGIN_AIRPORT"]]
+        d["DEST"] = d[up["DESTINATION_AIRPORT"]]
+        d["DEP_DELAY"] = pd.to_numeric(d[up["DEPARTURE_DELAY"]], errors="coerce")
+        d["ARR_DELAY"] = pd.to_numeric(d[up["ARRIVAL_DELAY"]], errors="coerce")
+        year_col = up.get("YEAR")
+        month_col = up.get("MONTH")
+        if year_col and month_col:
+            y = pd.to_numeric(d[year_col], errors="coerce").astype("Int64")
+            m = pd.to_numeric(d[month_col], errors="coerce").astype("Int64")
+            d["MONTH_LABEL"] = y.astype(str) + "-" + m.astype(str).str.zfill(2)
+        elif "FL_DATE" in up:
+            d["MONTH_LABEL"] = pd.to_datetime(d[up["FL_DATE"]], errors="coerce").dt.strftime("%Y-%m")
+        else:
+            d["MONTH_LABEL"] = pd.NaT
+
+    elif schema == "BTS":
+        d["CARRIER"] = d[up["OP_CARRIER"]]
+        d["ORIGIN"] = d[up["ORIGIN"]]
+        d["DEST"] = d[up["DEST"]]
+        d["DEP_DELAY"] = pd.to_numeric(d[up["DEP_DELAY"]], errors="coerce")
+        d["ARR_DELAY"] = pd.to_numeric(d[up["ARR_DELAY"]], errors="coerce")
+        if "FL_DATE" in up:
+            d["MONTH_LABEL"] = pd.to_datetime(d[up["FL_DATE"]], errors="coerce").dt.strftime("%Y-%m")
+        else:
+            year_col = up.get("YEAR")
+            month_col = up.get("MONTH")
+            if year_col and month_col:
+                y = pd.to_numeric(d[year_col], errors="coerce").astype("Int64")
+                m = pd.to_numeric(d[month_col], errors="coerce").astype("Int64")
+                d["MONTH_LABEL"] = y.astype(str) + "-" + m.astype(str).str.zfill(2)
+            else:
+                d["MONTH_LABEL"] = pd.NaT
     else:
-        # BTS-style: parse month from FL_DATE
-        df = df.rename(columns={
-            "OP_CARRIER": "CARRIER",
-            "DEP_DELAY":  "DEP_DELAY",
-            "ARR_DELAY":  "ARR_DELAY",
-        })
-        # Ensure FL_DATE is a datetime to derive month label
-        if not pd.api.types.is_datetime64_any_dtype(df.get("FL_DATE")):
-            df["FL_DATE"] = pd.to_datetime(df["FL_DATE"], errors="coerce")
-        df["MONTH_LABEL"] = df["FL_DATE"].dt.to_period("M").astype(str)
-        return df[["CARRIER", "ORIGIN", "DEST", "DEP_DELAY", "ARR_DELAY", "MONTH_LABEL"]]
+        raise ValueError(f"Unknown schema: {schema}")
 
-# ----------------- Optional enrichment dictionaries -----------------
-def load_airline_dict():
-    """
-    Returns {carrier_code: full_name} if AIRLINES_CSV is set and readable.
-    Kaggle airlines.csv schema: IATA_CODE,AIRLINE
-    """
-    if not AIRLINES_CSV or not os.path.exists(AIRLINES_CSV):
-        return None
+    return d[["CARRIER", "ORIGIN", "DEST", "DEP_DELAY", "ARR_DELAY", "MONTH_LABEL"]]
+
+# ---------- (Optional) enrichment via .env lookups ----------
+AIRLINE_NAMES: Dict[str, str] = {}
+AIRPORT_NAMES: Dict[str, str] = {}
+
+def _load_code_name_map(path: str) -> Dict[str, str]:
     try:
-        a = pd.read_csv(AIRLINES_CSV)
-        if "IATA_CODE" in a.columns and "AIRLINE" in a.columns:
-            return dict(zip(a["IATA_CODE"], a["AIRLINE"]))
-    except Exception as e:
-        logging.warning("Could not load AIRLINES_CSV: %s", e)
-    return None
+        df = pd.read_csv(path)
+        cols = list(df.columns)
+        if len(cols) < 2:
+            return {}
+        code_candidates = [c for c in cols if str(c).lower() in ("iata_code", "iata", "carrier_code", "code", "airline", "iata_code_active")]
+        name_candidates = [c for c in cols if str(c).lower() in ("airline", "airline_name", "name", "airport", "airport_name")]
+        code_col = code_candidates[0] if code_candidates else cols[0]
+        name_col = name_candidates[0] if name_candidates else cols[1]
+        mapping = dict(zip(df[code_col].astype(str), df[name_col].astype(str)))
+        return {k.strip(): v.strip() for k, v in mapping.items() if isinstance(k, str)}
+    except Exception:
+        return {}
 
-def load_airport_dict():
-    """
-    Returns {iata_code: airport_name} if AIRPORTS_CSV is set and readable.
-    Kaggle airports.csv schema: IATA_CODE,AIRPORT,...
-    """
-    if not AIRPORTS_CSV or not os.path.exists(AIRPORTS_CSV):
-        return None
-    try:
-        a = pd.read_csv(AIRPORTS_CSV)
-        if "IATA_CODE" in a.columns and "AIRPORT" in a.columns:
-            return dict(zip(a["IATA_CODE"], a["AIRPORT"]))
-    except Exception as e:
-        logging.warning("Could not load AIRPORTS_CSV: %s", e)
-    return None
+AIRLINES_CSV = os.getenv("AIRLINES_CSV")
+AIRPORTS_CSV = os.getenv("AIRPORTS_CSV")
+if AIRLINES_CSV and os.path.exists(AIRLINES_CSV):
+    AIRLINE_NAMES = _load_code_name_map(AIRLINES_CSV)
+if AIRPORTS_CSV and os.path.exists(AIRPORTS_CSV):
+    AIRPORT_NAMES = _load_code_name_map(AIRPORTS_CSV)
 
-AIRLINE_NAME = load_airline_dict()  # small; safe to keep in memory
-AIRPORT_NAME = load_airport_dict()  # small; safe to keep in memory
+def maybe_enrich_airline(rows: List[dict]) -> List[dict]:
+    if not AIRLINE_NAMES:
+        return rows
+    for r in rows:
+        if "carrier" in r:
+            r["airline_name"] = AIRLINE_NAMES.get(str(r["carrier"]), r["carrier"])
+    return rows
 
-# ----------------- IO helpers -----------------
-def load_df(csv_path: str, schema: str) -> pd.DataFrame:
-    """Load the whole file (for smaller CSVs) and normalize columns."""
-    df = pd.read_csv(
-        csv_path,
-        usecols=usecols_for(schema),
-        low_memory=False,
+def maybe_enrich_origin(rows: List[dict]) -> List[dict]:
+    if not AIRPORT_NAMES:
+        return rows
+    for r in rows:
+        if "origin" in r:
+            r["origin_name"] = AIRPORT_NAMES.get(str(r["origin"]), r["origin"])
+    return rows
+
+# ---------- Aggregations (in-memory) ----------
+def avg_arrival_delay_by_airline_df(df: pd.DataFrame) -> List[dict]:
+    g = df.groupby("CARRIER", dropna=False)["ARR_DELAY"].mean(numeric_only=True)
+    out = (
+        g.reset_index()
+         .rename(columns={"CARRIER": "carrier", "ARR_DELAY": "avg_arrival_delay"})
+         .sort_values("avg_arrival_delay")
     )
-    return normalize_columns(df, schema)
+    return maybe_enrich_airline(out.to_dict(orient="records"))
 
-def iter_chunks(csv_path: str, schema: str, chunksize: int):
-    """Yield normalized chunks for huge files."""
-    for c in pd.read_csv(
+def flights_by_origin_df(df: pd.DataFrame) -> List[dict]:
+    g = df.groupby("ORIGIN", dropna=False).size()
+    out = (
+        g.reset_index(name="flights")
+         .rename(columns={"ORIGIN": "origin"})
+         .sort_values("flights", ascending=False)
+    )
+    return maybe_enrich_origin(out.to_dict(orient="records"))
+
+def avg_dep_delay_by_month_df(df: pd.DataFrame) -> List[dict]:
+    g = df.groupby("MONTH_LABEL", dropna=False)["DEP_DELAY"].mean(numeric_only=True)
+    out = (
+        g.reset_index()
+         .rename(columns={"MONTH_LABEL": "month", "DEP_DELAY": "avg_departure_delay"})
+         .sort_values("month")
+    )
+    return out.to_dict(orient="records")
+
+# ---------- Aggregations (chunked) ----------
+def chunk_reader(csv_path: str, schema: str, chunksize: int) -> Iterable[pd.DataFrame]:
+    usecols = REQUIRED_COLS_KAGGLE if schema == "KAGGLE" else REQUIRED_COLS_BTS
+    for chunk in pd.read_csv(
         csv_path,
-        usecols=usecols_for(schema),
-        low_memory=False,
+        usecols=usecols,
+        dtype=str,
         chunksize=chunksize,
+        low_memory=False
     ):
-        yield normalize_columns(c, schema)
+        yield normalize_df(chunk, schema)
 
-# ----------------- Aggregations (operate on normalized columns) -----------------
-def avg_arrival_delay_by_airline_df(df: pd.DataFrame):
-    out = df.groupby("CARRIER")["ARR_DELAY"].mean().sort_values().reset_index()
-    out.columns = ["carrier", "avg_arrival_delay"]
-    # Optional: add airline names if mapping is available
-    if AIRLINE_NAME:
-        out["airline_name"] = out["carrier"].map(AIRLINE_NAME)
-    return out
+def avg_arrival_delay_by_airline_chunked(csv_path: str, schema: str, chunksize: int) -> List[dict]:
+    sums: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for c in chunk_reader(csv_path, schema, chunksize):
+        grp = c.groupby("CARRIER", dropna=False)["ARR_DELAY"].agg(["sum", "count"])
+        for carrier, row in grp.iterrows():
+            sums[carrier] = sums.get(carrier, 0.0) + float(row["sum"])
+            counts[carrier] = counts.get(carrier, 0) + int(row["count"])
+    rows = [{"carrier": k, "avg_arrival_delay": (sums[k] / (counts[k] or 1))} for k in sums]
+    rows.sort(key=lambda r: r["avg_arrival_delay"])
+    return maybe_enrich_airline(rows)
 
-def flights_by_origin_df(df: pd.DataFrame):
-    out = df.groupby("ORIGIN").size().sort_values(ascending=False).reset_index(name="flights")
-    out.columns = ["origin", "flights"]
-    if AIRPORT_NAME:
-        out["origin_name"] = out["origin"].map(AIRPORT_NAME)
-    return out
+def flights_by_origin_chunked(csv_path: str, schema: str, chunksize: int) -> List[dict]:
+    counts: Dict[str, int] = {}
+    for c in chunk_reader(csv_path, schema, chunksize):
+        grp = c.groupby("ORIGIN", dropna=False).size()
+        for origin, n in grp.items():
+            counts[origin] = counts.get(origin, 0) + int(n)
+    rows = [{"origin": k, "flights": v} for k, v in counts.items()]
+    rows.sort(key=lambda r: r["flights"], reverse=True)
+    return maybe_enrich_origin(rows)
 
-def avg_dep_delay_by_month_df(df: pd.DataFrame):
-    out = df.groupby("MONTH_LABEL")["DEP_DELAY"].mean().reset_index()
-    out.columns = ["month", "avg_departure_delay"]
-    return out
+def avg_dep_delay_by_month_chunked(csv_path: str, schema: str, chunksize: int) -> List[dict]:
+    sums: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for c in chunk_reader(csv_path, schema, chunksize):
+        grp = c.groupby("MONTH_LABEL", dropna=False)["DEP_DELAY"].agg(["sum", "count"])
+        for month, row in grp.iterrows():
+            sums[month] = sums.get(month, 0.0) + float(row["sum"])
+            counts[month] = counts.get(month, 0) + int(row["count"])
+    rows = [{"month": m, "avg_departure_delay": (sums[m] / (counts[m] or 1))} for m in sums]
+    rows.sort(key=lambda r: (r["month"] is None, r["month"]))
+    return rows
 
-# ----------------- Chunked incremental aggregations -----------------
-def avg_arrival_delay_by_airline_chunked(chunks):
-    sums, counts = {}, {}
-    for c in chunks:
-        g = c.groupby("CARRIER")["ARR_DELAY"].agg(["sum", "count"])
-        for carrier, row in g.iterrows():
-            sums[carrier]   = sums.get(carrier, 0.0) + float(row["sum"])
-            counts[carrier] = counts.get(carrier, 0)   + int(row["count"])
-    rows = [{"carrier": k, "avg_arrival_delay": (sums[k] / counts[k])} for k in sums if counts[k] > 0]
-    out = pd.DataFrame(rows).sort_values("avg_arrival_delay").reset_index(drop=True)
-    if AIRLINE_NAME:
-        out["airline_name"] = out["carrier"].map(AIRLINE_NAME)
-    return out
-
-def flights_by_origin_chunked(chunks):
-    counts = {}
-    for c in chunks:
-        g = c.groupby("ORIGIN").size()
-        for k, v in g.items():
-            counts[k] = counts.get(k, 0) + int(v)
-    out = pd.DataFrame([{"origin": k, "flights": v} for k, v in counts.items()]) \
-            .sort_values("flights", ascending=False).reset_index(drop=True)
-    if AIRPORT_NAME:
-        out["origin_name"] = out["origin"].map(AIRPORT_NAME)
-    return out
-
-def avg_dep_delay_by_month_chunked(chunks):
-    sums, counts = {}, {}
-    for c in chunks:
-        g = c.groupby("MONTH_LABEL")["DEP_DELAY"].agg(["sum", "count"])
-        for m, row in g.iterrows():
-            sums[m]   = sums.get(m, 0.0) + float(row["sum"])
-            counts[m] = counts.get(m, 0)   + int(row["count"])
-    rows = [{"month": k, "avg_departure_delay": (sums[k] / counts[k])} for k in sums if counts[k] > 0]
-    return pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
-
-# Map query name -> (in-memory fn, chunked fn)
+# ---------- Query registry ----------
 AGGS = {
     "avg_arr_delay_by_airline": (avg_arrival_delay_by_airline_df,  avg_arrival_delay_by_airline_chunked),
     "flights_by_origin":        (flights_by_origin_df,             flights_by_origin_chunked),
     "avg_dep_delay_by_month":   (avg_dep_delay_by_month_df,        avg_dep_delay_by_month_chunked),
 }
 
-# ----------------- Runner with caching -----------------
-def run_query(query_name: str, csv_path: str):
+# ---------- Execution ----------
+def run_query(query_name: str, csv_path: str, schema: str, chunksize: int = 0, enrich: bool = True) -> List[dict]:
     if query_name not in AGGS:
-        raise SystemExit(f"Unknown query '{query_name}'. Choices: {list(AGGS)}")
+        raise ValueError(f"Unknown query: {query_name}")
 
-    schema = detect_schema(csv_path)
-
-    # Cache key: depends on CSV path, query, logic version, chunksize AND schema
-    params = {"csv": os.path.abspath(csv_path), "v": 3, "chunksize": CHUNKSIZE, "schema": schema}
+    params = {
+        "csv": str(Path(csv_path).resolve()),
+        "schema": schema,
+        "chunksize": int(chunksize),
+        "v": 4,
+        "enrich": bool(enrich),
+    }
     cache_key = key_for(query_name, params)
 
-    # Try cache first
-    t0 = time.perf_counter()
     cached = get_json(cache_key)
     if cached is not None:
-        dt = (time.perf_counter() - t0) * 1000
-        logging.info("CACHE_HIT key=%s (%.1f ms)", cache_key, dt)
+        logging.info("CACHE_HIT key=%s", cache_key)
         incr("metrics:hits")
         return cached
 
-    # Compute
-    inmem_fn, chunked_fn = AGGS[query_name]
-    if CHUNKSIZE > 0:
-        logging.info("Chunked mode enabled (CHUNKSIZE=%s, schema=%s)", CHUNKSIZE, schema)
-        chunks = iter_chunks(csv_path, schema, CHUNKSIZE)
-        result_df = chunked_fn(chunks)
-    else:
-        df = load_df(csv_path, schema)
-        result_df = inmem_fn(df)
-
-    result = result_df.to_dict(orient="records")
-    set_json(cache_key, result)
-    logging.info("CACHE_MISS computed; cached key=%s", cache_key)
+    logging.info("CACHE_MISS key=%s", cache_key)
     incr("metrics:misses")
+
+    if chunksize and chunksize > 0:
+        compute_fn = AGGS[query_name][1]
+        result = compute_fn(csv_path, schema, chunksize)  # type: ignore
+    else:
+        usecols = REQUIRED_COLS_KAGGLE if schema == "KAGGLE" else REQUIRED_COLS_BTS
+        df = pd.read_csv(csv_path, usecols=usecols, dtype=str, low_memory=False)
+        df = normalize_df(df, schema)
+        compute_fn = AGGS[query_name][0]
+        result = compute_fn(df)  # type: ignore
+
+    set_json(cache_key, result, ttl=DEFAULT_TTL)
     return result
 
-def main():
-    p = argparse.ArgumentParser(description="Large CSV caching demo with Redis.")
+# ---------- CLI ----------
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Run cached CSV analytics")
     p.add_argument("--query", default="avg_arr_delay_by_airline", choices=list(AGGS.keys()))
-    p.add_argument("--csv", default=CSV_PATH, help="Path to CSV (overrides .env CSV_PATH).")
-    p.add_argument("--clear-cache", action="store_true", help="Clear cached aggregations and exit.")
-    p.add_argument("--show-cache", action="store_true", help="List keys and values currently cached in Redis")
+    p.add_argument("--csv", default=CSV_PATH_DEFAULT, help=f"Path to CSV (default: {CSV_PATH_DEFAULT})")
+    p.add_argument("--clear-cache", action="store_true", help="Clear cache entries with prefix 'agg:' and exit")
+    p.add_argument("--show-cache", action="store_true", help="List cached keys (and value snippets) and exit")
+    p.add_argument("--full", action="store_true", help="With --show-cache, pretty-print full JSON values")
+    p.add_argument("--limit", type=int, default=PRINT_LIMIT_DEFAULT, help=f"Limit rows printed (default: {PRINT_LIMIT_DEFAULT})")
+    return p
 
+# ---------- Main ----------
+if __name__ == "__main__":
+    p = build_arg_parser()
     args = p.parse_args()
 
-    if args.clear_cache:
-        clear_prefix("agg:")
-        logging.info("Cache cleared.")
-        return
- 
     if args.show_cache:
-    from cache import list_cache
-    entries = list_cache()
-    if not entries:
-        print("No cache entries found.")
-    else:
+        entries = list_cache()
+        if not entries:
+            print("No cache entries found.")
+            sys.exit(0)
+
         print(f"Found {len(entries)} cached keys:\n")
-        for k, v in entries:
-            print(f"{k} -> {v}")
-    sys.exit(0)
+        if args.full:
+            for k, _ in entries:
+                val = get_json(k)
+                print(k)
+                if val is None:
+                    print("  (nil)\n")
+                else:
+                    print(json.dumps(val, indent=2)[:100000], "\n")
+        else:
+            for k, v in entries:
+                print(f"{k} -> {v}")
+        sys.exit(0)
 
-    logging.info("Running query=%s on csv=%s", args.query, args.csv)
-    t0 = time.perf_counter()
-    result = run_query(args.query, args.csv)
-    total_ms = (time.perf_counter() - t0) * 1000
-    logging.info("Done in %.1f ms", total_ms)
+    if args.clear_cache:
+        deleted = clear_prefix("agg:")
+        logging.info("Cache cleared (%s keys deleted)", deleted)
+        sys.exit(0)
 
-    # Limit terminal noise: show first 10 rows
-    print(json.dumps(result[:10], indent=2))
+    # Friendly CSV existence check
+    if not os.path.exists(args.csv):
+        print(
+            f"CSV not found: {args.csv}\n"
+            "Tip: pass --csv PATH or set CSV_PATH in your .env.\n"
+            "Expected headers (either schema):\n"
+            "  Kaggle: AIRLINE, ORIGIN_AIRPORT, DESTINATION_AIRPORT, DEPARTURE_DELAY, ARRIVAL_DELAY, YEAR, MONTH\n"
+            "  BTS:    OP_CARRIER, ORIGIN, DEST, DEP_DELAY, ARR_DELAY, FL_DATE"
+        )
+        sys.exit(1)
 
-if __name__ == "__main__":
-    main()
+    schema = detect_schema(args.csv)
+    logging.info("Detected schema: %s", schema)
+
+    chunksize = 0
+    if CHUNK_SIZE_ENV:
+        try:
+            chunksize = int(CHUNK_SIZE_ENV)
+            logging.info("Chunked mode enabled: CHUNKSIZE=%s", chunksize)
+        except ValueError:
+            logging.warning("Invalid CHUNKSIZE env value '%s' (ignored)", CHUNK_SIZE_ENV)
+
+    result = run_query(
+        args.query,
+        args.csv,
+        schema,
+        chunksize=chunksize,
+        enrich=True,
+    )
+
+    to_print = result if args.limit is None else result[: args.limit]
+    print(json.dumps(to_print, indent=2))
