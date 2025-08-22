@@ -168,7 +168,7 @@ _Solo project_
 
 | query                    |   miss_sec |   hit_sec |
 |:-------------------------|-----------:|----------:|
-| avg_arr_delay_by_airline |     29.743 |     0.696 |
-| flights_by_origin        |     30.774 |     0.729 |
-| avg_dep_delay_by_month   |     30.563 |     0.65  |
+| avg_arr_delay_by_airline |     29.451 |     0.697 |
+| flights_by_origin        |     28.743 |     0.649 |
+| avg_dep_delay_by_month   |     27.465 |     0.686 |
 <!-- BENCHMARK:END -->
